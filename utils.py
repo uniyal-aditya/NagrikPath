@@ -25,7 +25,7 @@ _PLACEHOLDER_KEYS = {"", "your_api_key_here", "changeme"}
 
 # Gemini 1.5 and 2.0 Flash are retired. Newest stable Flash first, then fallbacks.
 # Override with GEMINI_MODEL (env var or Streamlit secret).
-DEFAULT_MODELS = ["gemini-3.5-flash", "gemini-flash-latest", "gemini-2.5-flash"]
+DEFAULT_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"]
 
 
 class NagrikPathError(Exception):
@@ -64,7 +64,9 @@ def get_api_key() -> str | None:
 
 def model_candidates() -> list[str]:
     override = _get_secret("GEMINI_MODEL")
-    return [override] if override else list(DEFAULT_MODELS)
+    if not override:
+        return list(DEFAULT_MODELS)
+    return [override] + [m for m in DEFAULT_MODELS if m != override]
 
 
 # --------------------------------------------------------------------------
@@ -253,28 +255,38 @@ def _generate(*, system_instruction: str, contents: str, json_mode: bool) -> str
         logger.error("Gemini client init failed: %r", exc)
         raise NagrikPathError("Could not start the AI client. Please check your API key.", repr(exc))
 
-    config = types.GenerateContentConfig(
-        system_instruction=system_instruction,
-        temperature=0.1,  # low creativity: this is a factual task
-        response_mime_type="application/json" if json_mode else None,
-    )
+    # Gemini 3.x: keep sampling parameters at their model defaults.
+    config_kwargs = {"system_instruction": system_instruction}
+    if json_mode:
+        config_kwargs["response_mime_type"] = "application/json"
+    config = types.GenerateContentConfig(**config_kwargs)
 
     last_kind, last_exc = "other", None
+    import time
+
     for model in model_candidates():
-        try:
-            resp = client.models.generate_content(model=model, contents=contents, config=config)
-        except Exception as exc:
-            last_kind, last_exc = _classify(exc), exc
-            logger.warning("Gemini call failed (model=%s, kind=%s): %r", model, last_kind, exc)
-            if last_kind in _FALLBACK_KINDS:
-                continue  # try the next model in the chain
-            break
+        resp = None
+        for retry in range(2):
+            try:
+                resp = client.models.generate_content(model=model, contents=contents, config=config)
+                break
+            except Exception as exc:
+                last_kind, last_exc = _classify(exc), exc
+                logger.warning("Gemini call failed (model=%s, attempt=%d, kind=%s): %r", model, retry + 1, last_kind, exc)
+                if last_kind in {"rate_limit", "overloaded"} and retry == 0:
+                    time.sleep(1.5)
+                    continue
+                if last_kind in _FALLBACK_KINDS:
+                    break
+                raise NagrikPathError(_USER_MESSAGES[last_kind], repr(last_exc))
+        if resp is None:
+            continue
         text = _response_text(resp)
         if text:
             return text
-        raise NagrikPathError(
-            "The AI returned an empty response (it may have been blocked). Try rephrasing or use a different notice."
-        )
+        last_kind = "other"
+        last_exc = RuntimeError(f"{model} returned an empty response")
+
     raise NagrikPathError(_USER_MESSAGES[last_kind], repr(last_exc))
 
 
