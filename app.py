@@ -1,11 +1,14 @@
 """NagrikPath - From Government Notice to Citizen Action."""
 from __future__ import annotations
 
+import base64
 import hashlib
 import html
 import logging
+import mimetypes
 import os
 import re
+from pathlib import Path
 
 import streamlit as st
 
@@ -15,10 +18,41 @@ from utils import NagrikPathError
 
 logger = logging.getLogger("nagrikpath")
 
-st.set_page_config(page_title="NagrikPath", page_icon="🇮🇳", layout="wide", initial_sidebar_state="collapsed")
+# --------------------------------------------------------------------------
+# Assets (assets/hero.png, assets/favicon.*)
+# --------------------------------------------------------------------------
+ASSETS_DIR = Path(__file__).resolve().parent / "assets"
+
+
+def _find_asset(stems: tuple[str, ...], exts: tuple[str, ...]) -> Path | None:
+    for stem in stems:
+        for ext in exts:
+            p = ASSETS_DIR / f"{stem}{ext}"
+            if p.is_file():
+                return p
+    return None
+
+
+FAVICON_PATH = _find_asset(("favicon", "icon"), (".png", ".ico", ".jpg", ".jpeg", ".webp", ".svg"))
+HERO_PATH = _find_asset(("hero",), (".png", ".jpg", ".jpeg", ".webp", ".svg"))
+
+
+@st.cache_data(show_spinner=False)
+def _data_uri(path_str: str) -> str:
+    path = Path(path_str)
+    mime = mimetypes.guess_type(path.name)[0] or "image/png"
+    return f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode("ascii")
+
+
+st.set_page_config(
+    page_title="NagrikPath",
+    page_icon=str(FAVICON_PATH) if FAVICON_PATH else "🇮🇳",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
 
 # --------------------------------------------------------------------------
-# Localised UI text for the results area
+# Localised UI text for the results area (keys MUST match prompts.LANGUAGES)
 # --------------------------------------------------------------------------
 LABELS = {
     "English": {
@@ -66,8 +100,13 @@ html,body,[class*="css"],.stApp{font-family:'Inter','Noto Sans Devanagari',syste
 .stApp{background:var(--bg);color:var(--text);}
 .block-container{max-width:1040px;padding-top:2rem;padding-bottom:4rem;}
 #MainMenu,footer,[data-testid="stToolbar"]{visibility:hidden;}
-.np-hero{padding:8px 0 28px 0;}
+.np-hero{padding:8px 0 28px 0;display:flex;align-items:center;justify-content:space-between;gap:28px;}
+.np-hero-text{flex:1 1 auto;min-width:0;}
+.np-hero-img{flex:0 0 auto;width:min(300px,36%);}
+.np-hero-img img{width:100%;height:auto;display:block;border-radius:18px;border:1px solid var(--line);box-shadow:0 10px 30px rgba(0,0,0,.35);}
+@media (max-width:760px){.np-hero{flex-direction:column;align-items:flex-start;}.np-hero-img{width:100%;max-width:340px;}}
 .np-brand{display:flex;align-items:center;gap:12px;font-size:2.1rem;font-weight:700;letter-spacing:-0.02em;}
+.np-brand img.logo{width:38px;height:38px;border-radius:8px;object-fit:cover;}
 .np-flag{display:flex;flex-direction:column;width:34px;height:22px;border-radius:4px;overflow:hidden;border:1px solid var(--line);}
 .np-flag i{flex:1;display:block;}
 .np-flag i:nth-child(1){background:#FF9933;}.np-flag i:nth-child(2){background:#F4F4F8;}.np-flag i:nth-child(3){background:#138808;}
@@ -184,14 +223,26 @@ def cached_audio(script: str, code: str) -> bytes:
 # Rendering helpers
 # --------------------------------------------------------------------------
 def render_header() -> None:
+    if FAVICON_PATH and FAVICON_PATH.suffix.lower() != ".ico":
+        mark = f'<img class="logo" src="{_data_uri(str(FAVICON_PATH))}" alt="NagrikPath logo">'
+    else:
+        mark = '<span class="np-flag"><i></i><i></i><i></i></span>'
+    hero = (
+        f'<div class="np-hero-img"><img src="{_data_uri(str(HERO_PATH))}" alt="NagrikPath illustration"></div>'
+        if HERO_PATH
+        else ""
+    )
     st.markdown(
         compact(
-            """
+            f"""
             <div class="np-hero">
-              <div class="np-brand"><span class="np-flag"><i></i><i></i><i></i></span><span class="nm">NagrikPath</span></div>
-              <div class="np-tag">From Government Notice to Citizen Action</div>
-              <div class="np-sub">Understand government information. Know what to do next.</div>
-              <div class="np-pills"><span class="np-pill">🤖 Powered by Gemini</span><span class="np-pill">🌐 English · हिंदी</span><span class="np-pill">🔊 Audio plan</span><span class="np-pill">🔒 Answers only from your notice</span></div>
+              <div class="np-hero-text">
+                <div class="np-brand">{mark}<span class="nm">NagrikPath</span></div>
+                <div class="np-tag">From Government Notice to Citizen Action</div>
+                <div class="np-sub">Understand government information. Know what to do next.</div>
+                <div class="np-pills"><span class="np-pill">🤖 Powered by Gemini</span><span class="np-pill">🌐 English · हिंदी</span><span class="np-pill">🔊 Audio plan</span><span class="np-pill">🔒 Answers only from your notice</span></div>
+              </div>
+              {hero}
             </div>
             """
         ),
@@ -417,7 +468,11 @@ if analysis is None:
 else:
     result_lang = st.session_state["analysis_lang"]
     if result_lang != lang:
-        st.info(f"The plan below is in {LANGUAGES[result_lang]['name'].split(' ')[0]}. Press “Generate action plan” to see it in {LANGUAGES[lang]['name'].split(' ')[0]}. Chat answers already follow your selected language.")
+        st.info(
+            f"The plan below is in {LANGUAGES[result_lang]['name'].split(' ')[0]}. "
+            f"Press “Generate action plan” to see it in {LANGUAGES[lang]['name'].split(' ')[0]}. "
+            "Chat answers already follow your selected language."
+        )
     render_results(analysis, result_lang)
     render_audio(analysis, result_lang)
     render_chat(lang)
