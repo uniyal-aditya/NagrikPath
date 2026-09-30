@@ -240,7 +240,7 @@ def render_header() -> None:
                 <div class="np-brand">{mark}<span class="nm">NagrikPath</span></div>
                 <div class="np-tag">From Government Notice to Citizen Action</div>
                 <div class="np-sub">Understand government information. Know what to do next.</div>
-                <div class="np-pills"><span class="np-pill">🤖 Powered by Gemini</span><span class="np-pill">🌐 English · हिंदी</span><span class="np-pill">🔊 Audio plan</span><span class="np-pill">🔒 Answers only from your notice</span></div>
+                <div class="np-pills"><span class="np-pill">🤖 Powered by Sarvam AI</span><span class="np-pill">🌐 English · हिंदी</span><span class="np-pill">🔊 Audio plan</span><span class="np-pill">🔒 Answers only from your notice</span></div>
               </div>
               {hero}
             </div>
@@ -407,6 +407,8 @@ def run_analysis(mode: str, uploaded, lang: str) -> None:
         if err.technical:
             logger.info("Analysis failed: %s", err.technical)
         st.error(err.user_message)
+        if os.getenv("NAGRIKPATH_DEBUG") == "1" and err.technical:
+            st.code(err.technical)
         return
     except Exception:
         logger.exception("Unexpected analysis error")
@@ -430,7 +432,7 @@ render_header()
 api_key_ok = utils.get_api_key() is not None
 if not api_key_ok:
     st.warning(
-        "Gemini API key not found. Add GEMINI_API_KEY to a .env file (local) or to Streamlit secrets (deployed), "
+        "Sarvam API key not found. Add SARVAM_API_KEY to a .env file (local) or to Streamlit secrets (deployed), "
         "then reload."
     )
 

@@ -1,4 +1,4 @@
-"""Helpers for NagrikPath: config, PDF text, Gemini calls, JSON safety, audio."""
+"""Helpers for NagrikPath: config, PDF text, Sarvam AI calls, JSON safety, audio."""
 from __future__ import annotations
 
 import io
@@ -6,7 +6,7 @@ import json
 import logging
 import os
 import re
-from functools import lru_cache
+import time
 from typing import Any
 
 from dotenv import load_dotenv
@@ -21,11 +21,15 @@ if not logging.getLogger().handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 MAX_NOTICE_CHARS = 60_000
-_PLACEHOLDER_KEYS = {"", "your_api_key_here", "changeme"}
+_PLACEHOLDER_KEYS = {"", "your_api_key_here", "your_sarvam_api_key", "changeme"}
 
-# Gemini 1.5 and 2.0 Flash are retired. Newest stable Flash first, then fallbacks.
-# Override with GEMINI_MODEL (env var or Streamlit secret).
-DEFAULT_MODELS = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-3.6-flash", "gemini-3.5-flash"]
+SARVAM_URL = "https://api.sarvam.ai/v1/chat/completions"
+REQUEST_TIMEOUT = 120  # seconds
+MAX_OUTPUT_TOKENS = 4000  # sarvam models reason before answering, so leave headroom
+
+# Sarvam chat models: 105B = best quality (128K context), 30B = faster (64K context).
+# Override with SARVAM_MODEL (env var or Streamlit secret).
+DEFAULT_MODELS = ["sarvam-105b", "sarvam-30b"]
 
 
 class NagrikPathError(Exception):
@@ -35,6 +39,13 @@ class NagrikPathError(Exception):
         super().__init__(technical or user_message)
         self.user_message = user_message
         self.technical = technical
+
+
+class _HttpError(Exception):
+    def __init__(self, status: int, body: str):
+        super().__init__(f"HTTP {status}: {body[:500]}")
+        self.status = status
+        self.body = body
 
 
 # --------------------------------------------------------------------------
@@ -56,14 +67,14 @@ def _get_secret(name: str) -> str | None:
 
 
 def get_api_key() -> str | None:
-    key = _get_secret("GEMINI_API_KEY")
+    key = _get_secret("SARVAM_API_KEY")
     if key is None or key.lower() in _PLACEHOLDER_KEYS:
         return None
     return key
 
 
 def model_candidates() -> list[str]:
-    override = _get_secret("GEMINI_MODEL")
+    override = _get_secret("SARVAM_MODEL")
     if not override:
         return list(DEFAULT_MODELS)
     return [override] + [m for m in DEFAULT_MODELS if m != override]
@@ -187,31 +198,22 @@ def validate_analysis(obj: dict, language: str = "English") -> dict:
 
 
 # --------------------------------------------------------------------------
-# Gemini
+# Sarvam AI
 # --------------------------------------------------------------------------
-@lru_cache(maxsize=2)
-def _client_for(api_key: str):
-    from google import genai  # current SDK (NOT the deprecated google-generativeai)
-
-    return genai.Client(api_key=api_key)
-
-
 def _classify(exc: Exception) -> str:
-    code = getattr(exc, "code", None)
-    status = str(getattr(exc, "status", "") or "").upper()
-    msg = str(exc).lower()
+    if isinstance(exc, _HttpError):
+        status, body = exc.status, exc.body.lower()
+        if status == 429:
+            return "rate_limit"
+        if status in (401, 403):
+            return "auth"
+        if status == 404 or (status in (400, 422) and "model" in body):
+            return "model_not_found"
+        if status >= 500:
+            return "overloaded"
+        return "other"
     kind_name = type(exc).__name__.lower()
-
-    if code == 429 or "RESOURCE_EXHAUSTED" in status:
-        return "rate_limit"
-    if code == 404 or "NOT_FOUND" in status:
-        return "model_not_found"
-    if code in (401, 403) or "PERMISSION_DENIED" in status or "UNAUTHENTICATED" in status:
-        return "auth"
-    if code == 400 and "api key" in msg:
-        return "auth"
-    if code in (500, 502, 503, 504) or status in ("UNAVAILABLE", "INTERNAL", "DEADLINE_EXCEEDED"):
-        return "overloaded"
+    msg = str(exc).lower()
     if isinstance(exc, (ConnectionError, TimeoutError)) or any(
         w in kind_name for w in ("connect", "timeout", "network", "socket")
     ):
@@ -222,9 +224,9 @@ def _classify(exc: Exception) -> str:
 
 
 _USER_MESSAGES = {
-    "rate_limit": "The AI service is busy or the free quota is used up. Please wait a minute and try again.",
-    "model_not_found": "The configured AI model is not available. Set GEMINI_MODEL to a current Gemini Flash model.",
-    "auth": "The Gemini API key was rejected. Check that GEMINI_API_KEY is correct and active.",
+    "rate_limit": "The AI service is busy or the quota is used up. Please wait a minute and try again.",
+    "model_not_found": "The configured AI model is not available. Set SARVAM_MODEL to sarvam-105b or sarvam-30b.",
+    "auth": "The Sarvam API key was rejected. Check that SARVAM_API_KEY is correct and active.",
     "overloaded": "The AI service is temporarily overloaded. Please try again in a moment.",
     "network": "Could not reach the AI service. Check your internet connection and try again.",
     "other": "The AI service returned an error. Please try again.",
@@ -232,56 +234,69 @@ _USER_MESSAGES = {
 _FALLBACK_KINDS = {"model_not_found", "overloaded", "rate_limit"}
 
 
-def _response_text(resp: Any) -> str:
+def _response_text(data: Any) -> str:
+    """Pull the answer out of a chat-completions response; drop any <think> reasoning block."""
     try:
-        return (resp.text or "").strip()
-    except Exception:  # .text can raise when the response is blocked/empty
+        content = data["choices"][0]["message"].get("content") or ""
+    except (KeyError, IndexError, TypeError, AttributeError):
         return ""
+    content = re.sub(r"<think>.*?</think>", "", content, flags=re.DOTALL | re.IGNORECASE)
+    content = re.sub(r"^.*?</think>", "", content, flags=re.DOTALL | re.IGNORECASE)  # unmatched closing tag
+    return content.strip()
+
+
+def _post_chat(key: str, model: str, system_instruction: str, contents: str) -> Any:
+    import requests
+
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_instruction},
+            {"role": "user", "content": contents},
+        ],
+        "temperature": 0.2,  # factual task: keep it steady
+        "max_tokens": MAX_OUTPUT_TOKENS,
+    }
+    headers = {"Authorization": f"Bearer {key}", "api-subscription-key": key, "Content-Type": "application/json"}
+    resp = requests.post(SARVAM_URL, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
+    if resp.status_code != 200:
+        raise _HttpError(resp.status_code, resp.text)
+    return resp.json()
 
 
 def _generate(*, system_instruction: str, contents: str, json_mode: bool) -> str:
     key = get_api_key()
     if not key:
         raise NagrikPathError(
-            "Gemini API key not found. Add GEMINI_API_KEY to your .env file (local) or Streamlit secrets (deployed)."
+            "Sarvam API key not found. Add SARVAM_API_KEY to your .env file (local) or Streamlit secrets (deployed)."
         )
     try:
-        from google.genai import types
-
-        client = _client_for(key)
+        import requests  # noqa: F401
     except ImportError as exc:
-        raise NagrikPathError("The google-genai package is missing. Run: pip install -r requirements.txt", str(exc))
-    except Exception as exc:
-        logger.error("Gemini client init failed: %r", exc)
-        raise NagrikPathError("Could not start the AI client. Please check your API key.", repr(exc))
+        raise NagrikPathError("The requests package is missing. Run: pip install -r requirements.txt", str(exc))
 
-    # Gemini 3.x: keep sampling parameters at their model defaults.
-    config_kwargs = {"system_instruction": system_instruction}
     if json_mode:
-        config_kwargs["response_mime_type"] = "application/json"
-    config = types.GenerateContentConfig(**config_kwargs)
+        system_instruction += "\n\nReturn only one valid JSON object. No markdown fences, no commentary."
 
     last_kind, last_exc = "other", None
-    import time
-
     for model in model_candidates():
-        resp = None
+        data = None
         for retry in range(2):
             try:
-                resp = client.models.generate_content(model=model, contents=contents, config=config)
+                data = _post_chat(key, model, system_instruction, contents)
                 break
             except Exception as exc:
                 last_kind, last_exc = _classify(exc), exc
-                logger.warning("Gemini call failed (model=%s, attempt=%d, kind=%s): %r", model, retry + 1, last_kind, exc)
+                logger.warning("Sarvam call failed (model=%s, attempt=%d, kind=%s): %r", model, retry + 1, last_kind, exc)
                 if last_kind in {"rate_limit", "overloaded"} and retry == 0:
                     time.sleep(1.5)
                     continue
                 if last_kind in _FALLBACK_KINDS:
                     break
                 raise NagrikPathError(_USER_MESSAGES[last_kind], repr(last_exc))
-        if resp is None:
+        if data is None:
             continue
-        text = _response_text(resp)
+        text = _response_text(data)
         if text:
             return text
         last_kind = "other"
