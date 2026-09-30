@@ -27,9 +27,9 @@ SARVAM_URL = "https://api.sarvam.ai/v1/chat/completions"
 REQUEST_TIMEOUT = 120  # seconds
 MAX_OUTPUT_TOKENS = 4000  # sarvam models reason before answering, so leave headroom
 
-# Sarvam chat models: 105B = best quality (128K context), 30B = faster (64K context).
+# Sarvam chat models. sarvam-30b was deprecated by Sarvam on 2026-09-30; do not use it.
 # Override with SARVAM_MODEL (env var or Streamlit secret).
-DEFAULT_MODELS = ["sarvam-105b", "sarvam-30b"]
+DEFAULT_MODELS = ["sarvam-105b", "sarvam-105b-conversations"]
 
 
 class NagrikPathError(Exception):
@@ -225,7 +225,7 @@ def _classify(exc: Exception) -> str:
 
 _USER_MESSAGES = {
     "rate_limit": "The AI service is busy or the quota is used up. Please wait a minute and try again.",
-    "model_not_found": "The configured AI model is not available. Set SARVAM_MODEL to sarvam-105b or sarvam-30b.",
+    "model_not_found": "The configured AI model is not available. Set SARVAM_MODEL to sarvam-105b or sarvam-105b-conversations.",
     "auth": "The Sarvam API key was rejected. Check that SARVAM_API_KEY is correct and active.",
     "overloaded": "The AI service is temporarily overloaded. Please try again in a moment.",
     "network": "Could not reach the AI service. Check your internet connection and try again.",
